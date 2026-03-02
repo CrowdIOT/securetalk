@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from 'react';
+import { createContext, useContext, useEffect, useState, useRef } from 'react';
 import { supabase } from '../lib/supabaseClient';
 
 const AuthContext = createContext({});
@@ -9,26 +9,37 @@ export function AuthProvider({ children }) {
     const [user, setUser] = useState(null);
     const [loading, setLoading] = useState(true);
     const [connectionError, setConnectionError] = useState(false);
+    const resolved = useRef(false);
 
     useEffect(() => {
-        // Timeout: if session check takes > 8 seconds, stop loading
+        // Timeout: if session check takes > 15 seconds, show error
         const timeout = setTimeout(() => {
-            setLoading(false);
-            setConnectionError(true);
-        }, 8000);
+            if (!resolved.current) {
+                resolved.current = true;
+                setLoading(false);
+                setConnectionError(true);
+            }
+        }, 15000);
 
         // Get initial session
         supabase.auth.getSession()
             .then(({ data: { session } }) => {
-                clearTimeout(timeout);
-                setUser(session?.user ?? null);
-                setLoading(false);
+                if (!resolved.current) {
+                    resolved.current = true;
+                    clearTimeout(timeout);
+                    setUser(session?.user ?? null);
+                    setLoading(false);
+                    // No session is NORMAL (user not logged in), NOT an error
+                }
             })
             .catch((err) => {
                 console.error('Session fetch error:', err);
-                clearTimeout(timeout);
-                setLoading(false);
-                setConnectionError(true);
+                if (!resolved.current) {
+                    resolved.current = true;
+                    clearTimeout(timeout);
+                    setLoading(false);
+                    setConnectionError(true);
+                }
             });
 
         // Listen for auth changes
