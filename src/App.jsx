@@ -3,7 +3,7 @@ import AuthPage from './pages/AuthPage';
 import ChatPage from './pages/ChatPage';
 
 function AppContent() {
-  const { user, loading } = useAuth();
+  const { user, loading, connectionError } = useAuth();
 
   if (loading) {
     return (
@@ -20,6 +20,29 @@ function AppContent() {
             SecureTalk
           </h1>
           <p className="text-dark-300 text-sm">Loading secure session...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (connectionError && !user) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <div className="bg-gradient-orbs" />
+        <div className="relative z-10 glass rounded-2xl p-8 max-w-md text-center">
+          <div className="text-danger text-lg font-semibold mb-2">Connection Error</div>
+          <p className="text-dark-200 text-sm mb-4">
+            Could not connect to the server. Please check that the Supabase environment variables are set correctly.
+          </p>
+          <p className="text-dark-400 text-xs mb-4 font-mono break-all">
+            URL: {import.meta.env.VITE_SUPABASE_URL || '(not set)'}
+          </p>
+          <button
+            onClick={() => window.location.reload()}
+            className="btn-primary"
+          >
+            Retry
+          </button>
         </div>
       </div>
     );

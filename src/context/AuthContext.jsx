@@ -8,37 +8,50 @@ export const useAuth = () => useContext(AuthContext);
 export function AuthProvider({ children }) {
     const [user, setUser] = useState(null);
     const [loading, setLoading] = useState(true);
+    const [connectionError, setConnectionError] = useState(false);
 
     useEffect(() => {
-        // Get initial session
-        supabase.auth.getSession().then(({ data: { session } }) => {
-            setUser(session?.user ?? null);
+        // Timeout: if session check takes > 8 seconds, stop loading
+        const timeout = setTimeout(() => {
             setLoading(false);
-        });
+            setConnectionError(true);
+        }, 8000);
+
+        // Get initial session
+        supabase.auth.getSession()
+            .then(({ data: { session } }) => {
+                clearTimeout(timeout);
+                setUser(session?.user ?? null);
+                setLoading(false);
+            })
+            .catch((err) => {
+                console.error('Session fetch error:', err);
+                clearTimeout(timeout);
+                setLoading(false);
+                setConnectionError(true);
+            });
 
         // Listen for auth changes
         const { data: { subscription } } = supabase.auth.onAuthStateChange(
             (_event, session) => {
                 setUser(session?.user ?? null);
                 setLoading(false);
+                setConnectionError(false);
             }
         );
 
-        return () => subscription.unsubscribe();
+        return () => {
+            clearTimeout(timeout);
+            subscription.unsubscribe();
+        };
     }, []);
 
-    /**
-     * Register a new user with email & password.
-     */
     async function signUp(email, password) {
         const { data, error } = await supabase.auth.signUp({ email, password });
         if (error) throw error;
         return data;
     }
 
-    /**
-     * Sign in with email & password.
-     */
     async function signIn(email, password) {
         const { data, error } = await supabase.auth.signInWithPassword({
             email,
@@ -48,9 +61,6 @@ export function AuthProvider({ children }) {
         return data;
     }
 
-    /**
-     * Sign out.
-     */
     async function signOut() {
         const { error } = await supabase.auth.signOut();
         if (error) throw error;
@@ -59,6 +69,7 @@ export function AuthProvider({ children }) {
     const value = {
         user,
         loading,
+        connectionError,
         signUp,
         signIn,
         signOut,
