@@ -9,38 +9,41 @@ export function AuthProvider({ children }) {
     const [user, setUser] = useState(null);
     const [loading, setLoading] = useState(true);
     const [connectionError, setConnectionError] = useState(false);
-    const resolved = useRef(false);
+    const retryCount = useRef(0);
+    const maxRetries = 10;
 
     useEffect(() => {
-        // Timeout: if session check takes > 15 seconds, show error
-        const timeout = setTimeout(() => {
-            if (!resolved.current) {
-                resolved.current = true;
-                setLoading(false);
-                setConnectionError(true);
-            }
-        }, 15000);
+        let cancelled = false;
 
-        // Get initial session
-        supabase.auth.getSession()
-            .then(({ data: { session } }) => {
-                if (!resolved.current) {
-                    resolved.current = true;
-                    clearTimeout(timeout);
-                    setUser(session?.user ?? null);
-                    setLoading(false);
-                    // No session is NORMAL (user not logged in), NOT an error
-                }
-            })
-            .catch((err) => {
-                console.error('Session fetch error:', err);
-                if (!resolved.current) {
-                    resolved.current = true;
-                    clearTimeout(timeout);
+        async function tryGetSession() {
+            try {
+                const { data: { session }, error } = await supabase.auth.getSession();
+                if (cancelled) return;
+
+                if (error) throw error;
+
+                setUser(session?.user ?? null);
+                setLoading(false);
+                setConnectionError(false);
+            } catch (err) {
+                console.error(`Session fetch attempt ${retryCount.current + 1} failed:`, err);
+                retryCount.current += 1;
+
+                if (cancelled) return;
+
+                if (retryCount.current < maxRetries) {
+                    // Retry after 3 seconds
+                    setTimeout(() => {
+                        if (!cancelled) tryGetSession();
+                    }, 3000);
+                } else {
                     setLoading(false);
                     setConnectionError(true);
                 }
-            });
+            }
+        }
+
+        tryGetSession();
 
         // Listen for auth changes
         const { data: { subscription } } = supabase.auth.onAuthStateChange(
@@ -52,7 +55,7 @@ export function AuthProvider({ children }) {
         );
 
         return () => {
-            clearTimeout(timeout);
+            cancelled = true;
             subscription.unsubscribe();
         };
     }, []);
