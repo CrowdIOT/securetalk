@@ -16,10 +16,18 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
     const [keyError, setKeyError] = useState('');
     const messagesEndRef = useRef(null);
     const channelRef = useRef(null);
+    const aesKeyRef = useRef(null);
+
+    // Keep aesKeyRef in sync so the realtime callback always has the latest key
+    useEffect(() => {
+        aesKeyRef.current = aesKey;
+    }, [aesKey]);
 
     // Scroll to bottom
     const scrollToBottom = useCallback(() => {
-        messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+        setTimeout(() => {
+            messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+        }, 50);
     }, []);
 
     // Derive the shared AES key with the selected user
@@ -31,9 +39,10 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
         async function deriveKey() {
             setAesKey(null);
             setKeyError('');
+            setMessages([]);
+            setLoading(true);
 
             try {
-                // Fetch recipient's public key
                 const { data, error } = await supabase
                     .from('user_public_keys')
                     .select('public_key')
@@ -42,6 +51,7 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
 
                 if (error || !data) {
                     setKeyError('Recipient has no encryption key yet.');
+                    setLoading(false);
                     return;
                 }
 
@@ -55,6 +65,7 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
                 console.error('Key derivation error:', err);
                 if (!cancelled) {
                     setKeyError('Failed to establish encrypted channel.');
+                    setLoading(false);
                 }
             }
         }
@@ -83,7 +94,6 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
 
                 if (error) throw error;
 
-                // Decrypt all messages
                 const decrypted = await Promise.all(
                     (data || []).map(async (msg) => {
                         try {
@@ -98,7 +108,7 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
                 if (!cancelled) {
                     setMessages(decrypted);
                     setLoading(false);
-                    setTimeout(scrollToBottom, 100);
+                    scrollToBottom();
                 }
             } catch (err) {
                 console.error('Fetch messages error:', err);
@@ -110,16 +120,17 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
         return () => { cancelled = true; };
     }, [aesKey, selectedUser, currentUser.id, scrollToBottom]);
 
-    // Subscribe to realtime for new messages
+    // Subscribe to realtime for new messages — single global listener
     useEffect(() => {
-        if (!aesKey || !selectedUser) return;
+        if (!selectedUser || !currentUser) return;
 
         // Cleanup previous channel
         if (channelRef.current) {
             supabase.removeChannel(channelRef.current);
+            channelRef.current = null;
         }
 
-        const channelName = `messages:${[currentUser.id, selectedUser.id].sort().join('-')}`;
+        const channelName = `chat-${[currentUser.id, selectedUser.id].sort().join('-')}`;
 
         const channel = supabase
             .channel(channelName)
@@ -140,27 +151,40 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
 
                     if (!isRelevant) return;
 
+                    // Use the ref to get the current aesKey (avoids stale closure)
+                    const currentAesKey = aesKeyRef.current;
+                    if (!currentAesKey) return;
+
                     try {
-                        const decryptedText = await decryptMessage(aesKey, msg.encrypted_message, msg.iv);
+                        const decryptedText = await decryptMessage(currentAesKey, msg.encrypted_message, msg.iv);
                         setMessages((prev) => {
                             // Avoid duplicates
                             if (prev.find((m) => m.id === msg.id)) return prev;
                             return [...prev, { ...msg, decryptedText }];
                         });
-                        setTimeout(scrollToBottom, 100);
+                        scrollToBottom();
                     } catch (err) {
                         console.error('Realtime decrypt error:', err);
+                        setMessages((prev) => {
+                            if (prev.find((m) => m.id === msg.id)) return prev;
+                            return [...prev, { ...msg, decryptedText: '[Decryption failed]' }];
+                        });
                     }
                 }
             )
-            .subscribe();
+            .subscribe((status) => {
+                console.log(`Realtime channel "${channelName}" status:`, status);
+            });
 
         channelRef.current = channel;
 
         return () => {
-            supabase.removeChannel(channel);
+            if (channelRef.current) {
+                supabase.removeChannel(channelRef.current);
+                channelRef.current = null;
+            }
         };
-    }, [aesKey, selectedUser, currentUser.id, scrollToBottom]);
+    }, [selectedUser?.id, currentUser?.id, scrollToBottom]);
 
     // Send an encrypted message
     async function handleSend(plaintext) {
@@ -176,6 +200,7 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
         });
 
         if (error) throw error;
+        // Message will appear via the realtime subscription
     }
 
     // Key error state
