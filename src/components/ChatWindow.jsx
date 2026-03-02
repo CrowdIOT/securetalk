@@ -17,8 +17,10 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
     const messagesEndRef = useRef(null);
     const channelRef = useRef(null);
     const aesKeyRef = useRef(null);
+    const pollingRef = useRef(null);
+    const lastMessageTimeRef = useRef(null);
 
-    // Keep aesKeyRef in sync so the realtime callback always has the latest key
+    // Keep aesKeyRef in sync
     useEffect(() => {
         aesKeyRef.current = aesKey;
     }, [aesKey]);
@@ -28,6 +30,16 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
         setTimeout(() => {
             messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
         }, 50);
+    }, []);
+
+    // Helper: decrypt a single message
+    const decryptMsg = useCallback(async (msg, key) => {
+        try {
+            const decryptedText = await decryptMessage(key, msg.encrypted_message, msg.iv);
+            return { ...msg, decryptedText };
+        } catch {
+            return { ...msg, decryptedText: '[Decryption failed]' };
+        }
     }, []);
 
     // Derive the shared AES key with the selected user
@@ -47,9 +59,10 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
                     .from('user_public_keys')
                     .select('public_key')
                     .eq('user_id', selectedUser.id)
-                    .single();
+                    .maybeSingle();
 
-                if (error || !data) {
+                if (error) throw error;
+                if (!data) {
                     setKeyError('Recipient has no encryption key yet.');
                     setLoading(false);
                     return;
@@ -74,17 +87,64 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
         return () => { cancelled = true; };
     }, [selectedUser, privateKey]);
 
-    // Fetch and decrypt messages when aesKey is ready
+    // Fetch all messages for this conversation
+    const fetchAllMessages = useCallback(async (key) => {
+        const activeKey = key || aesKeyRef.current;
+        if (!activeKey || !selectedUser) return;
+
+        try {
+            const { data, error } = await supabase
+                .from('messages')
+                .select('*')
+                .or(
+                    `and(sender_id.eq.${currentUser.id},receiver_id.eq.${selectedUser.id}),and(sender_id.eq.${selectedUser.id},receiver_id.eq.${currentUser.id})`
+                )
+                .order('created_at', { ascending: true });
+
+            if (error) throw error;
+
+            const decrypted = await Promise.all(
+                (data || []).map((msg) => decryptMsg(msg, activeKey))
+            );
+
+            setMessages(decrypted);
+            if (decrypted.length > 0) {
+                lastMessageTimeRef.current = decrypted[decrypted.length - 1].created_at;
+            }
+            scrollToBottom();
+            return decrypted;
+        } catch (err) {
+            console.error('Fetch messages error:', err);
+        }
+    }, [selectedUser, currentUser?.id, decryptMsg, scrollToBottom]);
+
+    // Fetch messages when aesKey is ready
     useEffect(() => {
         if (!aesKey || !selectedUser) return;
 
         let cancelled = false;
 
-        async function fetchMessages() {
+        async function init() {
             setLoading(true);
+            await fetchAllMessages(aesKey);
+            if (!cancelled) setLoading(false);
+        }
+
+        init();
+        return () => { cancelled = true; };
+    }, [aesKey, selectedUser, fetchAllMessages]);
+
+    // Polling for new messages (fallback if Realtime doesn't work)
+    useEffect(() => {
+        if (!aesKey || !selectedUser) return;
+
+        // Poll every 3 seconds for new messages
+        pollingRef.current = setInterval(async () => {
+            const activeKey = aesKeyRef.current;
+            if (!activeKey) return;
 
             try {
-                const { data, error } = await supabase
+                let query = supabase
                     .from('messages')
                     .select('*')
                     .or(
@@ -92,45 +152,54 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
                     )
                     .order('created_at', { ascending: true });
 
-                if (error) throw error;
+                // Only fetch newer messages if we have a last timestamp
+                if (lastMessageTimeRef.current) {
+                    query = query.gt('created_at', lastMessageTimeRef.current);
+                }
 
-                const decrypted = await Promise.all(
-                    (data || []).map(async (msg) => {
-                        try {
-                            const decryptedText = await decryptMessage(aesKey, msg.encrypted_message, msg.iv);
-                            return { ...msg, decryptedText };
-                        } catch {
-                            return { ...msg, decryptedText: '[Decryption failed]' };
-                        }
-                    })
+                const { data, error } = await query;
+                if (error || !data || data.length === 0) return;
+
+                const newDecrypted = await Promise.all(
+                    data.map((msg) => decryptMsg(msg, activeKey))
                 );
 
-                if (!cancelled) {
-                    setMessages(decrypted);
-                    setLoading(false);
-                    scrollToBottom();
-                }
+                setMessages((prev) => {
+                    const existingIds = new Set(prev.map((m) => m.id));
+                    const genuinelyNew = newDecrypted.filter((m) => !existingIds.has(m.id));
+                    if (genuinelyNew.length === 0) return prev;
+
+                    // Update the last message time
+                    const last = genuinelyNew[genuinelyNew.length - 1];
+                    lastMessageTimeRef.current = last.created_at;
+
+                    return [...prev, ...genuinelyNew];
+                });
+
+                scrollToBottom();
             } catch (err) {
-                console.error('Fetch messages error:', err);
-                if (!cancelled) setLoading(false);
+                // Silently ignore polling errors
             }
-        }
+        }, 3000);
 
-        fetchMessages();
-        return () => { cancelled = true; };
-    }, [aesKey, selectedUser, currentUser.id, scrollToBottom]);
+        return () => {
+            if (pollingRef.current) {
+                clearInterval(pollingRef.current);
+                pollingRef.current = null;
+            }
+        };
+    }, [aesKey, selectedUser?.id, currentUser?.id, decryptMsg, scrollToBottom]);
 
-    // Subscribe to realtime for new messages — single global listener
+    // Also try Realtime (will work instantly if Supabase Realtime is working)
     useEffect(() => {
         if (!selectedUser || !currentUser) return;
 
-        // Cleanup previous channel
         if (channelRef.current) {
             supabase.removeChannel(channelRef.current);
             channelRef.current = null;
         }
 
-        const channelName = `chat-${[currentUser.id, selectedUser.id].sort().join('-')}`;
+        const channelName = `chat-${[currentUser.id, selectedUser.id].sort().join('-')}-${Date.now()}`;
 
         const channel = supabase
             .channel(channelName)
@@ -144,36 +213,30 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
                 async (payload) => {
                     const msg = payload.new;
 
-                    // Only process messages for this conversation
                     const isRelevant =
                         (msg.sender_id === currentUser.id && msg.receiver_id === selectedUser.id) ||
                         (msg.sender_id === selectedUser.id && msg.receiver_id === currentUser.id);
 
                     if (!isRelevant) return;
 
-                    // Use the ref to get the current aesKey (avoids stale closure)
                     const currentAesKey = aesKeyRef.current;
                     if (!currentAesKey) return;
 
                     try {
-                        const decryptedText = await decryptMessage(currentAesKey, msg.encrypted_message, msg.iv);
+                        const decrypted = await decryptMsg(msg, currentAesKey);
                         setMessages((prev) => {
-                            // Avoid duplicates
                             if (prev.find((m) => m.id === msg.id)) return prev;
-                            return [...prev, { ...msg, decryptedText }];
+                            lastMessageTimeRef.current = msg.created_at;
+                            return [...prev, decrypted];
                         });
                         scrollToBottom();
                     } catch (err) {
                         console.error('Realtime decrypt error:', err);
-                        setMessages((prev) => {
-                            if (prev.find((m) => m.id === msg.id)) return prev;
-                            return [...prev, { ...msg, decryptedText: '[Decryption failed]' }];
-                        });
                     }
                 }
             )
             .subscribe((status) => {
-                console.log(`Realtime channel "${channelName}" status:`, status);
+                console.log('[Realtime] Channel status:', status);
             });
 
         channelRef.current = channel;
@@ -184,23 +247,37 @@ export default function ChatWindow({ currentUser, selectedUser, privateKey, show
                 channelRef.current = null;
             }
         };
-    }, [selectedUser?.id, currentUser?.id, scrollToBottom]);
+    }, [selectedUser?.id, currentUser?.id, decryptMsg, scrollToBottom]);
 
-    // Send an encrypted message
+    // Send an encrypted message — shows instantly (optimistic update)
     async function handleSend(plaintext) {
         if (!aesKey) return;
 
         const { ciphertext, iv } = await encryptMessage(aesKey, plaintext);
 
-        const { error } = await supabase.from('messages').insert({
-            sender_id: currentUser.id,
-            receiver_id: selectedUser.id,
-            encrypted_message: ciphertext,
-            iv: iv,
-        });
+        // Insert into database
+        const { data, error } = await supabase
+            .from('messages')
+            .insert({
+                sender_id: currentUser.id,
+                receiver_id: selectedUser.id,
+                encrypted_message: ciphertext,
+                iv: iv,
+            })
+            .select()
+            .single();
 
         if (error) throw error;
-        // Message will appear via the realtime subscription
+
+        // Immediately add to local messages (optimistic update)
+        if (data) {
+            setMessages((prev) => {
+                if (prev.find((m) => m.id === data.id)) return prev;
+                lastMessageTimeRef.current = data.created_at;
+                return [...prev, { ...data, decryptedText: plaintext }];
+            });
+            scrollToBottom();
+        }
     }
 
     // Key error state
